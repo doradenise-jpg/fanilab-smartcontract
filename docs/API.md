@@ -102,7 +102,7 @@ Initialize the escrow contract with admin and platform settings.
 
 **Parameters:**
 - `admin: Address` - Admin account with privileged operations
-- `token: Address` - Token contract used for escrow payments
+- `token: Address` - Configured Stellar token contract; must implement the token `decimals()` interface
 - `platform_fee_bps: u32` - Platform fee in basis points (e.g., 250 = 2.5%)
 
 **Authorization:** Contract deployer
@@ -636,6 +636,10 @@ Admin resolution: release to driver or refund to sender.
 
 **Authorization:** Admin only
 
+For escrows of at least 1,000,000 raw token units, direct admin calls are
+rejected; high-value verdicts must go through `dispute_resolution_contract`
+and receive approval from two distinct mediators.
+
 **Errors:**
 - `Unauthorized` - Caller not admin
 - `InvalidState` - Escrow not in Paused state
@@ -660,6 +664,10 @@ Admin resolution: split funds between sender and driver.
 - `sender_share_bps: u32` - Sender's share in basis points (0-10000)
 
 **Authorization:** Admin only
+
+For escrows of at least 1,000,000 raw token units, direct admin calls are
+rejected; high-value verdicts must go through `dispute_resolution_contract`
+and receive approval from two distinct mediators.
 
 **Errors:**
 - `Unauthorized` - Caller not admin
@@ -1657,50 +1665,68 @@ Initialize the dispute resolution contract.
 - `admin: Address` - Initial admin address
 - `delivery_contract: Address` - Address of the delivery contract
 - `escrow_contract: Address` - Address of the escrow contract
-- `dispute_time_limit: u64` - Seconds after delivery within which a dispute may be raised (must be ≥ `MIN_DISPUTE_TIME_LIMIT`, 1 day)
-- `dispute_resolution_limit: u64` - Seconds a dispute may stay `Open` before any party may `force_resolve_dispute` (must be ≥ `MIN_DISPUTE_RESOLUTION_LIMIT`, 1 day)
+- `dispute_time_limit: u64` - Seconds after delivery within which a dispute may be raised (1 day to 365 days)
+- `dispute_resolution_limit: u64` - Seconds a dispute may stay `Open` before any party may `force_resolve_dispute` (1 day to 365 days)
 
 **Authorization:** Contract deployer
 
 **Errors:**
 - `AlreadyInitialized` - Contract has already been initialized
-- `InvalidState` - `dispute_time_limit` or `dispute_resolution_limit` is below its floor
+- `InvalidState` - Either dispute window is outside the 1-day to 365-day range
 
 ### Admin Operations
 
 #### `add_admin`
-Grant admin privileges to a new address.
+Propose or confirm adding a mediator. The first current admin call creates a
+pending proposal; a different current admin must call `add_admin` with the
+same nominee to approve it. During initial bootstrap, the nominated admin
+instead calls `accept_admin` to confirm the first addition.
 
 **Parameters:**
 - `caller: Address` - Current admin
 - `new_admin: Address` - Address to promote
 
-**Authorization:** Existing admin
+**Authorization:** Existing admin; approval must come from two distinct current admins except for the nominee-confirmed bootstrap
 
 **Errors:**
 - `Unauthorized` - Caller is not an admin
 - `LimitExceeded` - The admin roster already holds `MAX_ADMINS` (50) entries
+- `InvalidState` - The same admin attempts to approve their own proposal, or the nominee is already an admin
 
 **Example:**
 ```rust
-dispute_contract.add_admin(&current_admin, &new_admin);
+dispute_contract.add_admin(&first_admin, &new_admin); // proposal
+dispute_contract.add_admin(&second_admin, &new_admin); // confirmation
+```
+
+#### `accept_admin`
+Confirm a first additional mediator during initial bootstrap. The nominee must
+authorize the call, and this path is available only while the original admin
+is the sole current admin.
+
+```rust
+dispute_contract.add_admin(&initial_admin, &new_admin);
+dispute_contract.accept_admin(&new_admin);
 ```
 
 #### `remove_admin`
-Revoke admin privileges from an address.
+Propose or confirm removing a mediator. A different current admin must confirm
+the same removal using a second `remove_admin` call.
 
 **Parameters:**
 - `caller: Address` - Current admin performing the removal
 - `old_admin: Address` - Address to demote
 
-**Authorization:** Existing admin
+**Authorization:** Two distinct current admins
 
 **Errors:**
 - `Unauthorized` - Caller is not an admin
+- `InvalidState` - The target is not an admin, the final admin would be removed, or the same admin attempts to approve their own proposal
 
 **Example:**
 ```rust
-dispute_contract.remove_admin(&current_admin, &old_admin);
+dispute_contract.remove_admin(&first_admin, &old_admin); // proposal
+dispute_contract.remove_admin(&second_admin, &old_admin); // confirmation
 ```
 
 #### `set_identity_reputation_contract`
@@ -1800,7 +1826,7 @@ Set the dispute auto-resolution window.
 
 **Errors:**
 - `Unauthorized` - Caller is not an admin
-- `InvalidState` - `new_limit` is below `MIN_DISPUTE_RESOLUTION_LIMIT` (86400 seconds)
+- `InvalidState` - `new_limit` is outside 86400 to 31536000 seconds (1 day to 365 days)
 
 #### `update_dispute_time_limit`
 Update the post-delivery dispute window.
@@ -1813,7 +1839,7 @@ Update the post-delivery dispute window.
 
 **Errors:**
 - `Unauthorized` - Caller is not an admin
-- `InvalidState` - `new_limit` is below `MIN_DISPUTE_TIME_LIMIT` (86400 seconds)
+- `InvalidState` - `new_limit` is outside 86400 to 31536000 seconds (1 day to 365 days)
 
 ### Query Functions
 
@@ -1986,6 +2012,12 @@ Admin verdict: full refund to sender. Applies a reputation penalty to the driver
 - `delivery_id: DeliveryId` - Delivery identifier
 
 **Authorization:** Admin only
+
+Escrows of at least 1,000,000 raw token units require two distinct admins to
+approve the same verdict. The first call records the proposed verdict without
+moving funds; a different admin must call the same resolution entry point with
+the same verdict to execute it. Lower-value escrow verdicts continue to execute
+on the first call.
 
 **Errors:**
 - `Unauthorized` - Caller is not an admin

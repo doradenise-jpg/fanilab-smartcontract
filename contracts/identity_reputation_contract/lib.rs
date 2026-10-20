@@ -460,7 +460,11 @@ impl IdentityReputationContract {
         weight_grams: u32,
         fragile: bool,
     ) {
-        require_escrow_not_paused(&env);
+        let delivery_contract = Self::get_delivery_contract(env.clone());
+        let dispute_contract = Self::get_dispute_contract(env.clone());
+        if caller != delivery_contract && caller != dispute_contract {
+            require_escrow_not_paused(&env);
+        }
         if !Self::is_authorized_contract(env.clone(), caller.clone()) {
             panic_with_error!(&env, FaniLabError::Unauthorized);
         }
@@ -523,7 +527,11 @@ impl IdentityReputationContract {
     /// (`increase_reputation`, `award_reputation`) freeze on suspension.
     #[allow(deprecated)] // events().publish() is deprecated in SDK 27.0.0 but still functional; tracked in SOROBAN_SDK_27_MIGRATION.md#event-system-migration (Issue #114)
     pub fn decrease_reputation(env: Env, caller: Address, driver: Address, points: u32) {
-        require_escrow_not_paused(&env);
+        let delivery_contract = Self::get_delivery_contract(env.clone());
+        let dispute_contract = Self::get_dispute_contract(env.clone());
+        if caller != delivery_contract && caller != dispute_contract {
+            require_escrow_not_paused(&env);
+        }
         if !Self::is_authorized_contract(env.clone(), caller.clone()) {
             panic_with_error!(&env, FaniLabError::Unauthorized);
         }
@@ -563,7 +571,11 @@ impl IdentityReputationContract {
     /// profile must not gain reputation until `reinstate_driver` restores it.
     #[allow(deprecated)] // events().publish() is deprecated in SDK 27.0.0 but still functional; tracked in SOROBAN_SDK_27_MIGRATION.md#event-system-migration (Issue #114)
     pub fn award_reputation(env: Env, caller: Address, driver: Address, points: u32) {
-        require_escrow_not_paused(&env);
+        let delivery_contract = Self::get_delivery_contract(env.clone());
+        let dispute_contract = Self::get_dispute_contract(env.clone());
+        if caller != delivery_contract && caller != dispute_contract {
+            require_escrow_not_paused(&env);
+        }
         if !Self::is_authorized_contract(env.clone(), caller.clone()) {
             panic_with_error!(&env, FaniLabError::Unauthorized);
         }

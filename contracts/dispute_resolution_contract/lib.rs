@@ -47,13 +47,12 @@ const _: () = {
 };
 
 const MIN_DISPUTE_TIME_LIMIT: u64 = 86400; // 1 day in seconds
+const MAX_DISPUTE_WINDOW: u64 = 365 * 24 * 60 * 60; // 1 year
 
 /// Lower bound for the dispute *resolution* window (the delay before any party
 /// may `force_resolve_dispute`). Mirrors `MIN_DISPUTE_TIME_LIMIT`: parties must
 /// always have at least a day to reach a verdict before the automatic fallback
-/// split can be forced. No upper bound is imposed — an over-long window only
-/// delays a safety-valve fallback and creates no attack surface for the trusted
-/// admin, so bounding it further would add friction without protection.
+/// split can be forced. Both dispute windows are capped at one year.
 const MIN_DISPUTE_RESOLUTION_LIMIT: u64 = 86400; // 1 day in seconds
 
 /// Maximum number of evidence hashes a single party may attach to one dispute.
@@ -132,6 +131,8 @@ pub struct DisputeCase {
 pub enum DataKey {
     Admin(Address),
     AdminList,
+    PendingAdminAdd(Address),
+    PendingAdminRemove(Address),
     DeliveryContract,
     EscrowContract,
     PendingDeliveryContract,
@@ -140,6 +141,7 @@ pub enum DataKey {
     DisputeTimeLimit,
     DisputeResolutionLimit,
     Dispute(DeliveryId),
+    PendingResolution(DeliveryId),
     DisputeReputationPenalty,
     DisputeReputationReward,
     DisputeSplitPenalty,
@@ -148,6 +150,21 @@ pub enum DataKey {
     DisputeIndex(u32),
     /// Total number of disputes ever recorded (monotonically increasing).
     DisputeIndexLen,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ResolutionVerdict {
+    RefundSender,
+    PayDriver,
+    Split(u32),
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PendingResolution {
+    approver: Address,
+    verdict: ResolutionVerdict,
 }
 
 /// Number of dispute IDs stored per index page.  Matches the paging
@@ -189,7 +206,7 @@ impl DisputeResolutionContract {
     /// `escrow_contract::resolve_dispute`'s own guard remains the
     /// authoritative check; this is a fail-fast layer with one implementation
     /// shared by all three entry points.
-    fn require_escrow_paused(env: &Env, delivery_id: DeliveryId) {
+    fn require_escrow_paused(env: &Env, delivery_id: DeliveryId) -> EscrowRecord {
         let escrow_addr: Address = env
             .storage()
             .instance()
@@ -203,6 +220,51 @@ impl DisputeResolutionContract {
         if escrow.status != EscrowStatus::Paused {
             panic_with_error!(env, FaniLabError::InvalidState);
         }
+        escrow
+    }
+
+    fn require_resolution_approval(
+        env: &Env,
+        caller: &Address,
+        delivery_id: DeliveryId,
+        escrow_amount: i128,
+        verdict: ResolutionVerdict,
+    ) -> bool {
+        if escrow_amount < HIGH_VALUE_DISPUTE_THRESHOLD {
+            return true;
+        }
+
+        let key = DataKey::PendingResolution(delivery_id);
+        if let Some(pending) = env.storage().persistent().get::<_, PendingResolution>(&key) {
+            if pending.verdict == verdict
+                && pending.approver != *caller
+                && DisputeResolutionContract::is_admin(env.clone(), pending.approver)
+            {
+                env.storage().persistent().remove(&key);
+                return true;
+            }
+        }
+
+        env.storage().persistent().set(
+            &key,
+            &PendingResolution {
+                approver: caller.clone(),
+                verdict,
+            },
+        );
+        env.storage().persistent().extend_ttl(
+            &key,
+            ttl::LEDGER_TTL_THRESHOLD,
+            ttl::LEDGER_TTL_EXTEND_TO,
+        );
+        env.events().publish(
+            (
+                Symbol::new(env, "resolution_approval_requested"),
+                delivery_id,
+            ),
+            (caller.clone(), escrow_amount),
+        );
+        false
     }
 }
 
@@ -224,10 +286,11 @@ impl DisputeResolutionContract {
             panic_with_error!(&env, FaniLabError::AlreadyInitialized);
         }
         admin.require_auth();
-        if dispute_time_limit < MIN_DISPUTE_TIME_LIMIT {
+        if !(MIN_DISPUTE_TIME_LIMIT..=MAX_DISPUTE_WINDOW).contains(&dispute_time_limit) {
             panic_with_error!(&env, FaniLabError::InvalidState);
         }
-        if dispute_resolution_limit < MIN_DISPUTE_RESOLUTION_LIMIT {
+        if !(MIN_DISPUTE_RESOLUTION_LIMIT..=MAX_DISPUTE_WINDOW).contains(&dispute_resolution_limit)
+        {
             panic_with_error!(&env, FaniLabError::InvalidState);
         }
         env.storage()
@@ -273,21 +336,80 @@ impl DisputeResolutionContract {
             panic_with_error!(&env, FaniLabError::LimitExceeded);
         }
 
-        env.storage()
-            .instance()
-            .set(&DataKey::Admin(new_admin.clone()), &true);
+        if Self::is_admin(env.clone(), new_admin.clone()) {
+            panic_with_error!(&env, FaniLabError::InvalidState);
+        }
 
-        if !admin_list.iter().any(|a| a == new_admin) {
+        let key = DataKey::PendingAdminAdd(new_admin.clone());
+        if let Some(proposer) = env.storage().instance().get::<_, Address>(&key) {
+            if proposer == caller {
+                panic_with_error!(&env, FaniLabError::InvalidState);
+            }
+            if !Self::is_admin(env.clone(), proposer) {
+                env.storage().instance().set(&key, &caller);
+                env.events().publish(
+                    (Symbol::new(&env, "admin_add_proposed"),),
+                    (caller, new_admin),
+                );
+                return;
+            }
+            env.storage().instance().remove(&key);
             admin_list.push_back(new_admin.clone());
             env.storage()
                 .instance()
+                .set(&DataKey::Admin(new_admin.clone()), &true);
+            env.storage()
+                .instance()
                 .set(&DataKey::AdminList, &admin_list);
+            env.events()
+                .publish((Symbol::new(&env, "admin_added"),), (caller, new_admin));
+        } else {
+            env.storage().instance().set(&key, &caller);
+            env.events().publish(
+                (Symbol::new(&env, "admin_add_proposed"),),
+                (caller, new_admin),
+            );
+        }
+    }
+
+    #[allow(deprecated)] // events().publish() is deprecated in SDK 27.0.0 but still functional; tracked in SOROBAN_SDK_27_MIGRATION.md#event-system-migration (Issue #114)
+    pub fn accept_admin(env: Env, new_admin: Address) {
+        new_admin.require_auth();
+        let key = DataKey::PendingAdminAdd(new_admin.clone());
+        let proposer = env
+            .storage()
+            .instance()
+            .get::<_, Address>(&key)
+            .unwrap_or_else(|| panic_with_error!(&env, FaniLabError::InvalidState));
+        let admin_list: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::AdminList)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        // The initial administrator cannot obtain an existing co-signature.
+        // Require the proposed administrator's own acceptance for this
+        // one-time bootstrap path; all later additions need two current admins.
+        if admin_list.len() != 1
+            || admin_list.get(0) != Some(proposer.clone())
+            || !Self::is_admin(env.clone(), proposer.clone())
+            || Self::is_admin(env.clone(), new_admin.clone())
+            || admin_list.len() >= MAX_ADMINS
+        {
+            panic_with_error!(&env, FaniLabError::InvalidState);
         }
 
-        // Issue #212: emit a roster-change event so the remaining admins and
-        // any off-chain monitoring can detect additions immediately.
+        let mut updated_admin_list = admin_list;
+        updated_admin_list.push_back(new_admin.clone());
+        env.storage().instance().remove(&key);
+        env.storage()
+            .instance()
+            .set(&DataKey::Admin(new_admin.clone()), &true);
+        env.storage()
+            .instance()
+            .set(&DataKey::AdminList, &updated_admin_list);
         env.events()
-            .publish((Symbol::new(&env, "admin_added"),), (caller, new_admin));
+            .publish((Symbol::new(&env, "admin_added"),), (proposer, new_admin));
     }
 
     #[allow(deprecated)] // events().publish() is deprecated in SDK 27.0.0 but still functional; tracked in SOROBAN_SDK_27_MIGRATION.md#event-system-migration (Issue #114)
@@ -324,27 +446,46 @@ impl DisputeResolutionContract {
             panic_with_error!(&env, FaniLabError::InvalidState);
         }
 
-        // Issue #212: a single admin must not be able to consolidate the
-        // roster down to only themselves in one uninterrupted sequence.
-        // Reducing the roster to exactly one admin is therefore permitted
-        // only when the caller is removing themselves (a deliberate
-        // step-down); an admin removing a *different* admin may never leave
-        // itself as the sole remaining admin. Legitimate removals still work
-        // while at least one other admin remains, and a full hand-off is done
-        // by adding the successor first and then stepping down.
-        if new_list.len() == 1 && old_admin != caller {
-            panic_with_error!(&env, FaniLabError::InvalidState);
+        let key = DataKey::PendingAdminRemove(old_admin.clone());
+        if let Some(proposer) = env.storage().instance().get::<_, Address>(&key) {
+            if proposer == caller {
+                panic_with_error!(&env, FaniLabError::InvalidState);
+            }
+            if !Self::is_admin(env.clone(), proposer) {
+                env.storage().instance().set(&key, &caller);
+                env.events().publish(
+                    (Symbol::new(&env, "admin_remove_proposed"),),
+                    (caller, old_admin),
+                );
+                return;
+            }
+
+            let mut new_list = Vec::new(&env);
+            for admin in admin_list.iter() {
+                if admin != old_admin {
+                    new_list.push_back(admin);
+                }
+            }
+
+            if new_list.is_empty() {
+                panic_with_error!(&env, FaniLabError::InvalidState);
+            }
+
+            env.storage().instance().remove(&key);
+            env.storage()
+                .instance()
+                .remove(&DataKey::Admin(old_admin.clone()));
+            env.storage().instance().set(&DataKey::AdminList, &new_list);
+
+            env.events()
+                .publish((Symbol::new(&env, "admin_removed"),), (caller, old_admin));
+        } else {
+            env.storage().instance().set(&key, &caller);
+            env.events().publish(
+                (Symbol::new(&env, "admin_remove_proposed"),),
+                (caller, old_admin),
+            );
         }
-
-        env.storage()
-            .instance()
-            .remove(&DataKey::Admin(old_admin.clone()));
-        env.storage().instance().set(&DataKey::AdminList, &new_list);
-
-        // Issue #212: emit a roster-change event identifying the caller and
-        // the removed address for the remaining admins / off-chain monitors.
-        env.events()
-            .publish((Symbol::new(&env, "admin_removed"),), (caller, old_admin));
     }
 
     pub fn is_admin(env: Env, admin: Address) -> bool {
@@ -636,7 +777,7 @@ impl DisputeResolutionContract {
         // Same floor init enforces: never let the resolution window drop below
         // one day, or a dispute could be force-resolved out from under the
         // parties before they have any chance to reach a verdict.
-        if new_limit < MIN_DISPUTE_RESOLUTION_LIMIT {
+        if !(MIN_DISPUTE_RESOLUTION_LIMIT..=MAX_DISPUTE_WINDOW).contains(&new_limit) {
             panic_with_error!(&env, FaniLabError::InvalidState);
         }
         let old_limit = Self::get_dispute_resolution_limit(env.clone());
@@ -660,7 +801,7 @@ impl DisputeResolutionContract {
         // The one-day floor is an invariant, not just a construction-time check:
         // enforce it here too, or an admin could set it to 0 and close the
         // post-delivery dispute window for every delivery in a single call.
-        if new_limit < MIN_DISPUTE_TIME_LIMIT {
+        if !(MIN_DISPUTE_TIME_LIMIT..=MAX_DISPUTE_WINDOW).contains(&new_limit) {
             panic_with_error!(&env, FaniLabError::InvalidState);
         }
         let old_limit = Self::get_dispute_time_limit(env.clone());
@@ -873,7 +1014,16 @@ impl DisputeResolutionContract {
 
         // Issue #211: reject a non-Paused escrow before any state mutation or
         // cross-contract side effect (the reputation adjustment below).
-        Self::require_escrow_paused(&env, delivery_id);
+        let escrow = Self::require_escrow_paused(&env, delivery_id);
+        if !Self::require_resolution_approval(
+            &env,
+            &caller,
+            delivery_id,
+            escrow.amount,
+            ResolutionVerdict::RefundSender,
+        ) {
+            return;
+        }
 
         dispute.status = DisputeStatus::ResolvedRefund;
         dispute.resolved_at = Some(env.ledger().timestamp());
@@ -922,7 +1072,7 @@ impl DisputeResolutionContract {
             &Symbol::new(&env, "resolve_dispute"),
             soroban_sdk::vec![
                 &env,
-                caller.into_val(&env),
+                env.current_contract_address().into_val(&env),
                 u64::from(delivery_id).into_val(&env),
                 false.into_val(&env),
             ],
@@ -996,7 +1146,16 @@ impl DisputeResolutionContract {
         // Issue #211: reject a non-Paused escrow before any state mutation or
         // cross-contract side effect, via the same shared precondition used by
         // the other two resolution entry points.
-        Self::require_escrow_paused(&env, delivery_id);
+        let escrow = Self::require_escrow_paused(&env, delivery_id);
+        if !Self::require_resolution_approval(
+            &env,
+            &caller,
+            delivery_id,
+            escrow.amount,
+            ResolutionVerdict::Split(sender_share_bps),
+        ) {
+            return;
+        }
 
         dispute.status = DisputeStatus::Split;
         dispute.resolved_at = Some(env.ledger().timestamp());
@@ -1041,7 +1200,7 @@ impl DisputeResolutionContract {
             &Symbol::new(&env, "resolve_dispute_split"),
             soroban_sdk::vec![
                 &env,
-                caller.into_val(&env),
+                env.current_contract_address().into_val(&env),
                 u64::from(delivery_id).into_val(&env),
                 sender_share_bps.into_val(&env),
             ],
@@ -1089,7 +1248,16 @@ impl DisputeResolutionContract {
 
         // Issue #211: reject a non-Paused escrow before any state mutation or
         // cross-contract side effect (the reputation adjustment below).
-        Self::require_escrow_paused(&env, delivery_id);
+        let escrow = Self::require_escrow_paused(&env, delivery_id);
+        if !Self::require_resolution_approval(
+            &env,
+            &caller,
+            delivery_id,
+            escrow.amount,
+            ResolutionVerdict::PayDriver,
+        ) {
+            return;
+        }
 
         dispute.status = DisputeStatus::ResolvedPayout;
         dispute.resolved_at = Some(env.ledger().timestamp());
@@ -1109,7 +1277,7 @@ impl DisputeResolutionContract {
             &Symbol::new(&env, "resolve_dispute"),
             soroban_sdk::vec![
                 &env,
-                caller.into_val(&env),
+                env.current_contract_address().into_val(&env),
                 u64::from(delivery_id).into_val(&env),
                 true.into_val(&env),
             ],
